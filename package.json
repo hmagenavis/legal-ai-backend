@@ -1,25 +1,78 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { OpenAI } = require('openai');
+const pdf = require('pdf-parse');
+const { RecursiveCharacterTextSplitter } = require('langchain/text_splitter');
+const { MemoryVectorStore } = require('langchain/vectorstores/memory');
+const { OpenAIEmbeddings } = require('@langchain/openai');
 require('dotenv').config();
 
 const app = express();
-
-// הגדרות אבטחה - מאפשר לאתר שלך ב-cPanel לפנות לשרת הזה
-app.use(cors({
-    origin: '*' // בעתיד כדאי לשנות לכתובת האתר האמיתית שלך
-}));
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// משיכת מפתח ה-API של OpenAI מהגדרות הסביבה ששמנו ב-Render
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-});
+// אתחול OpenAI
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const embeddings = new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY });
 
-const SYSTEM_PROMPT = `אתה יועץ משפטי מומחה בתחום חדלות פרעון.
-ענה תמיד בעברית בלבד. התבסס על המידע המצורף (אם יש).`;
+// משתנה שיחזיק את המידע מהמסמכים בזיכרון
+let vectorStore = null;
 
-// הנתיב שאליו האתר שלך ישלח את השאלות
+// פונקציה לטעינה ועיבוד של קבצי ה-PDF
+async function initializeRAG() {
+    try {
+        const docsPath = path.join(__dirname, 'docs');
+        
+        // יצירת התיקייה אם היא לא קיימת
+        if (!fs.existsSync(docsPath)) {
+            console.log("Creating 'docs' directory...");
+            fs.mkdirSync(docsPath);
+            return;
+        }
+
+        const files = fs.readdirSync(docsPath).filter(file => file.endsWith('.pdf'));
+        
+        if (files.length === 0) {
+            console.log("No PDF files found in 'docs' folder. Bot will answer using general knowledge.");
+            return;
+        }
+
+        console.log(`Processing ${files.length} PDF files...`);
+        let combinedText = "";
+
+        for (const file of files) {
+            const dataBuffer = fs.readFileSync(path.join(docsPath, file));
+            const data = await pdf(dataBuffer);
+            combinedText += data.text + "\n\n";
+            console.log(`Successfully parsed: ${file}`);
+        }
+
+        // חלוקת הטקסט למקטעים קטנים (Chunks) כדי שהחיפוש יהיה מדויק
+        const splitter = new RecursiveCharacterTextSplitter({
+            chunkSize: 800,
+            chunkOverlap: 150,
+        });
+        
+        const docs = await splitter.createDocuments([combinedText]);
+
+        // יצירת מאגר וקטורי בזיכרון השרת
+        vectorStore = await MemoryVectorStore.fromDocuments(docs, embeddings);
+        console.log("RAG system initialized and ready! 📚");
+    } catch (error) {
+        console.error("Error during RAG initialization:", error);
+    }
+}
+
+const SYSTEM_PROMPT = `אתה יועץ משפטי מומחה בתחום חדלות פרעון בישראל.
+תפקידך לענות על שאלות בהתבסס על המידע המקצועי שסופק לך.
+הנחיות חשובות:
+1. אם התשובה נמצאת במידע המצורף (Context), השתמש בה בראש ובראשונה.
+2. אם המידע לא נמצא במסמכים, ענה על בסיס הידע הכללי שלך אך ציין שזהו מידע כללי.
+3. תמיד סיים בהבהרה שהמידע אינו מהווה ייעוץ משפטי פרטני ושיש לפנות לעורך דין.
+4. ענה תמיד בעברית בלבד.`;
+
 app.post('/api/chat', async (req, res) => {
     try {
         const { question, history } = req.body;
@@ -28,44 +81,51 @@ app.post('/api/chat', async (req, res) => {
             return res.status(400).json({ error: "No question provided" });
         }
 
-        /* ===============================================================
-        כאן בעתיד יכנס הקוד של ה-RAG (חיבור לקבצי ה-PDF)
-        =============================================================== */
+        let context = "";
+        
+        // חיפוש המידע הרלוונטי ביותר מהמסמכים
+        if (vectorStore) {
+            const results = await vectorStore.similaritySearch(question, 3);
+            context = results.map(r => r.pageContent).join("\n---\n");
+        }
 
-        // סידור היסטוריית השיחה לפורמט ש-OpenAI מבין
         const formattedHistory = (history || []).map(msg => ({
             role: msg.role === 'bot' ? 'assistant' : 'user',
             content: msg.content
         }));
 
-        // בניית מערך ההודעות השלם כולל הנחיות המערכת
         const messages = [
             { role: "system", content: SYSTEM_PROMPT },
+            { role: "system", content: `מידע רלוונטי מהמסמכים (Context):\n${context}` },
             ...formattedHistory,
             { role: "user", content: question }
         ];
 
-        // פניה למודל של OpenAI 
         const response = await openai.chat.completions.create({
-            model: "gpt-4o", // המודל החכם ביותר כרגע
+            model: "gpt-4o",
             messages: messages,
+            temperature: 0.7
         });
 
         res.json({ reply: response.choices[0].message.content });
 
     } catch (error) {
-        console.error("Error calling OpenAI API:", error);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        console.error("Error in chat endpoint:", error);
+        res.status(500).json({ error: "Internal Server Error" });
     }
 });
 
-// בדיקה שהשרת חי
 app.get('/health', (req, res) => {
-    res.send("OpenAI Server is running smoothly! 🟢");
+    res.json({ 
+        status: "Running", 
+        rag_active: !!vectorStore,
+        model: "gpt-4o"
+    });
 });
 
-// הפעלת השרת
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});});
+app.listen(PORT, async () => {
+    console.log(`Server listening on port ${PORT}`);
+    // אתחול ה-RAG ברגע שהשרת עולה
+    await initializeRAG();
+});
