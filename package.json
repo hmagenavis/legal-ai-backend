@@ -1,0 +1,73 @@
+const express = require('express');
+const cors = require('cors');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+require('dotenv').config();
+
+const app = express();
+
+// הגדרות אבטחה - מאפשר לאתר שלך ב-cPanel לפנות לשרת הזה
+app.use(cors({
+    origin: '*' // בהמשך, כשהאתר באוויר, מומלץ לשנות את הכוכבית לכתובת האתר האמיתית שלך
+}));
+app.use(express.json());
+
+// משיכת מפתח ה-API ממשתני הסביבה (כדי שיהיה מאובטח ולא יופיע בקוד!)
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// פונקציה שעושה סדר בהיסטוריית ההודעות עבור ג'מיני
+const formatHistory = (history) => {
+    return history.map(msg => ({
+        role: msg.role === 'bot' ? 'model' : 'user',
+        parts: [{ text: msg.content }]
+    }));
+};
+
+const SYSTEM_PROMPT = `אתה יועץ משפטי מומחה בתחום חדלות פרעון.
+ענה תמיד בעברית בלבד. התבסס על המידע המצורף (אם יש).`;
+
+// הנתיב שאליו האתר שלך ישלח את השאלות
+app.post('/api/chat', async (req, res) => {
+    try {
+        const { question, history } = req.body;
+
+        if (!question) {
+            return res.status(400).json({ error: "No question provided" });
+        }
+
+        /* ===============================================================
+        כאן בעתיד יכנס הקוד של ה-RAG:
+        1. ניקח את ה-question של המשתמש.
+        2. נחפש במסד נתונים (כמו Pinecone) את פסקאות ה-PDF הרלוונטיות.
+        3. נוסיף את הפסקאות האלו ל-SYSTEM_PROMPT או לשאלה.
+        ===============================================================
+        */
+
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-09-2025" });
+        
+        // יצירת צ'אט שמכיל את היסטוריית השיחה
+        const chat = model.startChat({
+            history: formatHistory(history || []),
+            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
+        });
+
+        const result = await chat.sendMessage(question);
+        const responseText = result.response.text();
+
+        res.json({ reply: responseText });
+
+    } catch (error) {
+        console.error("Error calling Gemini API:", error);
+        res.status(500).json({ error: "Internal Server Error", details: error.message });
+    }
+});
+
+// בדיקה שהשרת חי
+app.get('/health', (req, res) => {
+    res.send("Server is running smoothly! 🟢");
+});
+
+// הפעלת השרת על הפורט ש-Render יקצה לו
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
