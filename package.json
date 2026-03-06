@@ -1,131 +1,18 @@
-const express = require('express');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const { OpenAI } = require('openai');
-const pdf = require('pdf-parse');
-const { RecursiveCharacterTextSplitter } = require('langchain/text_splitter');
-const { MemoryVectorStore } = require('langchain/vectorstores/memory');
-const { OpenAIEmbeddings } = require('@langchain/openai');
-require('dotenv').config();
-
-const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
-
-// אתחול OpenAI
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const embeddings = new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY });
-
-// משתנה שיחזיק את המידע מהמסמכים בזיכרון
-let vectorStore = null;
-
-// פונקציה לטעינה ועיבוד של קבצי ה-PDF
-async function initializeRAG() {
-    try {
-        const docsPath = path.join(__dirname, 'docs');
-        
-        // יצירת התיקייה אם היא לא קיימת
-        if (!fs.existsSync(docsPath)) {
-            console.log("Creating 'docs' directory...");
-            fs.mkdirSync(docsPath);
-            return;
-        }
-
-        const files = fs.readdirSync(docsPath).filter(file => file.endsWith('.pdf'));
-        
-        if (files.length === 0) {
-            console.log("No PDF files found in 'docs' folder. Bot will answer using general knowledge.");
-            return;
-        }
-
-        console.log(`Processing ${files.length} PDF files...`);
-        let combinedText = "";
-
-        for (const file of files) {
-            const dataBuffer = fs.readFileSync(path.join(docsPath, file));
-            const data = await pdf(dataBuffer);
-            combinedText += data.text + "\n\n";
-            console.log(`Successfully parsed: ${file}`);
-        }
-
-        // חלוקת הטקסט למקטעים קטנים (Chunks) כדי שהחיפוש יהיה מדויק
-        const splitter = new RecursiveCharacterTextSplitter({
-            chunkSize: 800,
-            chunkOverlap: 150,
-        });
-        
-        const docs = await splitter.createDocuments([combinedText]);
-
-        // יצירת מאגר וקטורי בזיכרון השרת
-        vectorStore = await MemoryVectorStore.fromDocuments(docs, embeddings);
-        console.log("RAG system initialized and ready! 📚");
-    } catch (error) {
-        console.error("Error during RAG initialization:", error);
-    }
+{
+  "name": "legal-ai-backend",
+  "version": "1.0.0",
+  "description": "Backend server for AI Legal Chatbot with PDF support (RAG)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.28.0",
+    "pdf-parse": "^1.1.1",
+    "langchain": "^0.1.25",
+    "@langchain/openai": "^0.0.14"
+  }
 }
-
-const SYSTEM_PROMPT = `אתה יועץ משפטי מומחה בתחום חדלות פרעון בישראל.
-תפקידך לענות על שאלות בהתבסס על המידע המקצועי שסופק לך.
-הנחיות חשובות:
-1. אם התשובה נמצאת במידע המצורף (Context), השתמש בה בראש ובראשונה.
-2. אם המידע לא נמצא במסמכים, ענה על בסיס הידע הכללי שלך אך ציין שזהו מידע כללי.
-3. תמיד סיים בהבהרה שהמידע אינו מהווה ייעוץ משפטי פרטני ושיש לפנות לעורך דין.
-4. ענה תמיד בעברית בלבד.`;
-
-app.post('/api/chat', async (req, res) => {
-    try {
-        const { question, history } = req.body;
-
-        if (!question) {
-            return res.status(400).json({ error: "No question provided" });
-        }
-
-        let context = "";
-        
-        // חיפוש המידע הרלוונטי ביותר מהמסמכים
-        if (vectorStore) {
-            const results = await vectorStore.similaritySearch(question, 3);
-            context = results.map(r => r.pageContent).join("\n---\n");
-        }
-
-        const formattedHistory = (history || []).map(msg => ({
-            role: msg.role === 'bot' ? 'assistant' : 'user',
-            content: msg.content
-        }));
-
-        const messages = [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "system", content: `מידע רלוונטי מהמסמכים (Context):\n${context}` },
-            ...formattedHistory,
-            { role: "user", content: question }
-        ];
-
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: messages,
-            temperature: 0.7
-        });
-
-        res.json({ reply: response.choices[0].message.content });
-
-    } catch (error) {
-        console.error("Error in chat endpoint:", error);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: "Running", 
-        rag_active: !!vectorStore,
-        model: "gpt-4o"
-    });
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, async () => {
-    console.log(`Server listening on port ${PORT}`);
-    // אתחול ה-RAG ברגע שהשרת עולה
-    await initializeRAG();
-});
